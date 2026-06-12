@@ -17,7 +17,11 @@ use crate::lexer::Span;
 use crate::rvm::instructions::{BuiltinCallParams, FunctionCallParams};
 use crate::rvm::Instruction;
 use crate::utils::get_path_string;
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 enum CallTarget {
     User {
@@ -46,6 +50,9 @@ impl<'a> Compiler<'a> {
         let original_fcn_path = fcn_path.clone();
         let full_fcn_path = if self.policy.inner.rules.contains_key(&fcn_path) {
             fcn_path
+        } else if let Some(resolved) = self.resolve_fcn_path_through_imports(&original_fcn_path) {
+            // Resolve a leading import alias before module-prefixing and builtins.
+            resolved
         } else {
             get_path_string(fcn, Some(&self.current_package))
                 .map_err(|_| CompilerError::InvalidFunctionExpressionWithPackage.at(&span))?
@@ -166,6 +173,31 @@ impl<'a> Compiler<'a> {
         }
 
         Ok(dest)
+    }
+
+    /// Rewrite an import-aliased call path to its target, e.g. `b.f(1)` to
+    /// `data.a.b.f` after `import data.a.b`. Resolves only to a known rule, so
+    /// (matching OPA) the alias shadows builtins.
+    fn resolve_fcn_path_through_imports(&self, path: &str) -> Option<String> {
+        if self.policy.inner.imports.is_empty() || path.starts_with("data.") {
+            return None;
+        }
+        let (alias, rest) = match path.split_once('.') {
+            Some((alias, rest)) => (alias, Some(rest)),
+            None => (path, None),
+        };
+        let import_key = format!("{}.{}", &self.current_package, alias);
+        let import_expr = self.policy.inner.imports.get(&import_key)?;
+        let target = get_path_string(import_expr, None).ok()?;
+        let candidate = match rest {
+            Some(rest) => format!("{target}.{rest}"),
+            None => target,
+        };
+        if self.policy.inner.rules.contains_key(&candidate) {
+            Some(candidate)
+        } else {
+            None
+        }
     }
 
     fn lookup_builtin_arity(&self, name: &str) -> Option<usize> {

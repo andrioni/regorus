@@ -1250,7 +1250,17 @@ impl Interpreter {
                 let path: Vec<&str> = path.iter().map(|s| s.text()).collect();
                 let mut target = path.join(".");
 
-                let mut target_is_function = self.lookup_function_by_name(&target).is_some()
+                // Resolve an aliased target before builtins (as at the call
+                // site); only known functions register as overrides.
+                let mut target_is_function = false;
+                if let Some(resolved) = self.resolve_fcn_path_through_imports(&target) {
+                    if self.compiled_policy.functions.contains_key(&resolved) {
+                        target = resolved;
+                        target_is_function = true;
+                    }
+                }
+                target_is_function = target_is_function
+                    || self.lookup_function_by_name(&target).is_some()
                     || Self::is_builtin(wm.refr.span(), &target);
 
                 if !target_is_function
@@ -1286,11 +1296,17 @@ impl Interpreter {
                             if self.lookup_function_by_name(&function_path).is_none() {
                                 // Lookup without current module path prefixed.
                                 function_path = get_path_string(&wm.r#as, None)?;
-                                if self.lookup_function_by_name(&function_path).is_none()
-                                    && !Self::is_builtin(wm.r#as.span(), &function_path)
-                                {
-                                    // bail!(wm.r#as.span().error("could not evaluate expression"));
-                                    skip_exec = true;
+                                if self.lookup_function_by_name(&function_path).is_none() {
+                                    // Resolve an aliased replacement before builtins.
+                                    let resolved = self
+                                        .resolve_fcn_path_through_imports(&function_path)
+                                        .filter(|r| self.compiled_policy.functions.contains_key(r));
+                                    if let Some(resolved) = resolved {
+                                        function_path = resolved;
+                                    } else if !Self::is_builtin(wm.r#as.span(), &function_path) {
+                                        // bail!(wm.r#as.span().error("could not evaluate expression"));
+                                        skip_exec = true;
+                                    }
                                 }
                             }
                             self.with_functions
@@ -2360,6 +2376,31 @@ impl Interpreter {
         }
     }
 
+    /// Rewrite an import-aliased call path to its target, e.g. `b.f(1)` to
+    /// `data.a.b.f` after `import data.a.b`. Resolves only to a known function
+    /// or default rule, so (matching OPA) the alias shadows builtins.
+    fn resolve_fcn_path_through_imports(&self, path: &str) -> Option<String> {
+        if self.compiled_policy.imports.is_empty() || path.starts_with("data.") {
+            return None;
+        }
+
+        let (alias, rest) = match path.split_once('.') {
+            Some((alias, rest)) => (alias, Some(rest)),
+            None => (path, None),
+        };
+        let import_key = format!("{}.{}", self.current_module_path, alias);
+        let import_expr = self.compiled_policy.imports.get(&import_key)?;
+
+        let target = get_path_string(import_expr, None).ok()?;
+        let candidate = match rest {
+            Some(rest) => format!("{target}.{rest}"),
+            None => target,
+        };
+        (self.compiled_policy.functions.contains_key(&candidate)
+            || self.compiled_policy.default_rules.contains_key(&candidate))
+        .then_some(candidate)
+    }
+
     fn eval_builtin_call(
         &mut self,
         span: &Span,
@@ -2530,6 +2571,13 @@ impl Interpreter {
         for p in params {
             param_values.push(self.eval_expr(p)?);
         }
+
+        // Resolve a leading import alias before the `with` override and builtin
+        // lookups, so an override keyed by the full path reaches aliased calls
+        // and the alias shadows a like-named builtin namespace (matching OPA).
+        let fcn_path = self
+            .resolve_fcn_path_through_imports(&fcn_path)
+            .unwrap_or(fcn_path);
 
         let orig_fcn_path = fcn_path.clone();
 
